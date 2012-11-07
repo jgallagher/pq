@@ -10,7 +10,11 @@ import (
 	"time"
 )
 
-func openTestConn(t *testing.T) *sql.DB {
+type Fatalistic interface {
+	Fatal(args ...interface{})
+}
+
+func openTestConn(t Fatalistic) *sql.DB {
 	datname := os.Getenv("PGDATABASE")
 	sslmode := os.Getenv("PGSSLMODE")
 
@@ -254,7 +258,7 @@ func TestPGError(t *testing.T) {
 		t.Fatal("expected error")
 	}
 
-	if err != driver.ErrBadConn {
+	if err, ok := err.(PGError); !ok {
 		t.Fatalf("expected a PGError, got: %v", err)
 	}
 }
@@ -273,7 +277,7 @@ func TestBadConn(t *testing.T) {
 
 	func() {
 		defer errRecover(&err)
-		e := &PGError{c: make(map[byte]string)}
+		e := &pgError{c: make(map[byte]string)}
 		e.c['S'] = Efatal
 		panic(e)
 	}()
@@ -289,7 +293,7 @@ func TestErrorOnExec(t *testing.T) {
 
 	sql := "DO $$BEGIN RAISE unique_violation USING MESSAGE='foo'; END; $$;"
 	_, err := db.Exec(sql)
-	_, ok := err.(*PGError)
+	_, ok := err.(PGError)
 	if !ok {
 		t.Fatalf("expected PGError, was: %#v", err)
 	}
@@ -315,7 +319,7 @@ func TestErrorOnQuery(t *testing.T) {
 		t.Fatal("unexpected row, want error")
 	}
 
-	_, ok := r.Err().(*PGError)
+	_, ok := r.Err().(PGError)
 	if !ok {
 		t.Fatalf("expected PGError, was: %#v", r.Err())
 	}
@@ -414,5 +418,26 @@ func TestNullAfterNonNull(t *testing.T) {
 
 	if n.Int64 != 0 {
 		t.Fatalf("expected n to 2, not %d", n.Int64)
+	}
+}
+
+// Stress test the performance of parsing results from the wire.
+func BenchmarkResultParsing(b *testing.B) {
+	b.StopTimer()
+
+	db := openTestConn(b)
+	defer db.Close()
+	_, err := db.Exec("BEGIN")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.StartTimer()
+	for i := 0; i < b.N; i++ {
+		res, err := db.Query("SELECT generate_series(1, 50000)")
+		if err != nil {
+			b.Fatal(err)
+		}
+		res.Close()
 	}
 }

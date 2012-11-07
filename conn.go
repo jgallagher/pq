@@ -1,6 +1,7 @@
 package pq
 
 import (
+	"bufio"
 	"crypto/md5"
 	"crypto/tls"
 	"database/sql"
@@ -19,7 +20,7 @@ import (
 
 var (
 	ErrSSLNotSupported = errors.New("pq: SSL is not enabled on the server")
-	ErrNotSupported    = errors.New("pq: this is postgres, a real database, this isn't a valid command")
+	ErrNotSupported    = errors.New("pq: invalid command")
 )
 
 type drv struct{}
@@ -34,11 +35,13 @@ func init() {
 
 type conn struct {
 	c     net.Conn
+	buf   *bufio.Reader
 	namei int
 }
 
 func Open(name string) (_ driver.Conn, err error) {
 	defer errRecover(&err)
+	defer errRecoverWithPGReason(&err)
 
 	o := make(Values)
 
@@ -73,6 +76,7 @@ func Open(name string) (_ driver.Conn, err error) {
 
 	cn := &conn{c: c}
 	cn.ssl(o)
+	cn.buf = bufio.NewReader(cn.c)
 	cn.startup(o)
 	return cn, nil
 }
@@ -137,10 +141,36 @@ func (cn *conn) gname() string {
 	return strconv.FormatInt(int64(cn.namei), 10)
 }
 
+func (cn *conn) simpleQuery(q string) (res driver.Result, err error) {
+	defer errRecover(&err)
+
+	b := newWriteBuf('Q')
+	b.string(q)
+	cn.send(b)
+
+	for {
+		t, r := cn.recv1()
+		switch t {
+		case 'C':
+			res = parseComplete(r.string())
+		case 'Z':
+			// done
+			return
+		case 'E':
+			err = parseError(r)
+		case 'T', 'N':
+			// ignore
+		default:
+			errorf("unknown response for simple query: %q", t)
+		}
+	}
+	panic("not reached")
+}
+
 func (cn *conn) prepareTo(q, stmtName string) (_ driver.Stmt, err error) {
 	defer errRecover(&err)
 
-	st := &stmt{cn: cn, name: stmtName}
+	st := &stmt{cn: cn, name: stmtName, query: q}
 
 	b := newWriteBuf('P')
 	b.string(st.name)
@@ -158,7 +188,7 @@ func (cn *conn) prepareTo(q, stmtName string) (_ driver.Stmt, err error) {
 	for {
 		t, r := cn.recv1()
 		switch t {
-		case '1', '2':
+		case '1', '2', 'N':
 		case 't':
 			st.nparams = int(r.int16())
 		case 'T':
@@ -174,7 +204,7 @@ func (cn *conn) prepareTo(q, stmtName string) (_ driver.Stmt, err error) {
 		case 'n':
 			// no data
 		case 'Z':
-			return st, nil
+			return st, err
 		case 'E':
 			err = parseError(r)
 		default:
@@ -199,6 +229,12 @@ func (cn *conn) Close() (err error) {
 // Implement the optional "Execer" interface for one-shot queries
 func (cn *conn) Exec(query string, args []driver.Value) (_ driver.Result, err error) {
 	defer errRecover(&err)
+
+	// Check to see if we can use the "simpleQuery" interface, which is
+	// *much* faster than going through prepare/exec
+	if len(args) == 0 {
+		return cn.simpleQuery(query)
+	}
 
 	// Use the unnamed statement to defer planning until bind
 	// time, or else value-based selectivity estimates cannot be
@@ -238,7 +274,7 @@ func (cn *conn) recv() (t byte, r *readBuf) {
 		case 'E':
 			panic(parseError(r))
 		case 'N':
-			// TODO(bmizerany): log notices?
+			// ignore
 		default:
 			return
 		}
@@ -249,14 +285,14 @@ func (cn *conn) recv() (t byte, r *readBuf) {
 
 func (cn *conn) recv1() (byte, *readBuf) {
 	x := make([]byte, 5)
-	_, err := io.ReadFull(cn.c, x)
+	_, err := io.ReadFull(cn.buf, x)
 	if err != nil {
 		panic(err)
 	}
 
 	b := readBuf(x[1:])
 	y := make([]byte, b.int32()-4)
-	_, err = io.ReadFull(cn.c, y)
+	_, err = io.ReadFull(cn.buf, y)
 	if err != nil {
 		panic(err)
 	}
@@ -344,6 +380,7 @@ func (cn *conn) auth(r *readBuf, o Values) {
 type stmt struct {
 	cn      *conn
 	name    string
+	query   string
 	cols    []string
 	nparams int
 	ooid    []int
@@ -405,6 +442,10 @@ func (st *stmt) Query(v []driver.Value) (_ driver.Rows, err error) {
 
 func (st *stmt) Exec(v []driver.Value) (res driver.Result, err error) {
 	defer errRecover(&err)
+
+	if len(v) == 0 {
+		return st.cn.simpleQuery(st.query)
+	}
 	st.exec(v)
 
 	for {
@@ -470,6 +511,8 @@ func (st *stmt) exec(v []driver.Value) {
 				panic(err)
 			}
 			return
+		case 'N':
+			// ignore
 		default:
 			errorf("unexpected bind response: %q", t)
 		}
@@ -540,7 +583,7 @@ func (rs *rows) Next(dest []driver.Value) (err error) {
 		switch t {
 		case 'E':
 			err = parseError(r)
-		case 'C', 'S':
+		case 'C', 'S', 'N':
 			continue
 		case 'Z':
 			rs.done = true
